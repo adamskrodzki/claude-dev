@@ -1,5 +1,32 @@
 import { Anthropic } from "@anthropic-ai/sdk"
 import OpenAI from "openai"
+import { ToolResponse } from "./path-utils"
+
+
+export function formatToolResponseWithImages(text: string, images?: string[]): ToolResponse {
+	if (images && images.length > 0) {
+		const textBlock: Anthropic.TextBlockParam = { type: "text", text }
+		const imageBlocks: Anthropic.ImageBlockParam[] = formatImagesIntoBlocks(images)
+		// Placing images after text leads to better results
+		return [textBlock, ...imageBlocks]
+	} else {
+		return text
+	}
+}
+
+export function formatImagesIntoBlocks(images?: string[]): Anthropic.ImageBlockParam[] {
+	return images
+		? images.map((dataUrl) => {
+				// data:image/png;base64,base64string
+				const [rest, base64] = dataUrl.split(",")
+				const mimeType = rest.split(":")[1].split(";")[0]
+				return {
+					type: "image",
+					source: { type: "base64", media_type: mimeType, data: base64 },
+				} as Anthropic.ImageBlockParam
+		  })
+		: []
+}
 
 export function convertToOpenAiMessages(
 	anthropicMessages: Anthropic.Messages.MessageParam[]

@@ -1,18 +1,14 @@
 import { Anthropic } from "@anthropic-ai/sdk"
 import defaultShell from "default-shell"
 import delay from "delay"
-import * as diff from "diff"
-import fs from "fs/promises"
-import os from "os"
-import osName from "os-name"
 import pWaitFor from "p-wait-for"
+import fs from "fs/promises"
 import * as path from "path"
 import { serializeError } from "serialize-error"
 import { PromptBuilder } from './prompts';
-import * as vscode from "vscode"
 import { ApiHandler, buildApiHandler } from "./api"
 import { TerminalManager } from "./integrations/TerminalManager"
-import { listFiles, parseSourceCodeForDefinitionsTopLevel } from "./parse-source-code"
+import { parseSourceCodeForDefinitionsTopLevel } from "./parse-source-code"
 import { ClaudeDevProvider } from "./providers/ClaudeDevProvider"
 import { ApiConfiguration } from "./shared/api"
 import { ClaudeRequestResult } from "./shared/ClaudeRequestResult"
@@ -23,21 +19,16 @@ import { getApiMetrics } from "./shared/getApiMetrics"
 import { HistoryItem } from "./shared/HistoryItem"
 import { Tool, ToolName } from "./shared/Tool"
 import { ClaudeAskResponse } from "./shared/WebviewMessage"
-import { findLast, findLastIndex, formatContentBlockToMarkdown } from "./utils"
+import { findLast, findLastIndex, formatContentBlockToMarkdown, formatFilesList, getReadablePath, cwd, ToolResponse } from "./utils"
 import { truncateHalfConversation } from "./utils/context-management"
 import { extractTextFromFile } from "./utils/extract-text"
 import { regexSearchFiles } from "./utils/ripgrep"
 import { parseMentions } from "./utils/context-mentions"
 import { UrlContentFetcher } from "./utils/UrlContentFetcher"
-import { diagnosticsToProblemsString, getNewDiagnostics } from "./utils/diagnostics"
-import { arePathsEqual } from "./utils/path-helpers"
+import { EnvironmentManager } from "./EnvironmentManager"
+import { FileSystemHandler } from "./FileSystemHandler"
+import { formatImagesIntoBlocks, formatToolResponseWithImages } from "./utils/openai-format"
 
-
-const cwd =
-	vscode.workspace.workspaceFolders?.map((folder) => folder.uri.fsPath).at(0) ?? path.join(os.homedir(), "Desktop") // may or may not exist but fs checking existence would immediately ask for permission which would be bad UX, need to come up with a better solution
-
-
-type ToolResponse = string | Array<Anthropic.TextBlockParam | Anthropic.ImageBlockParam>
 type UserContent = Array<
 	Anthropic.TextBlockParam | Anthropic.ImageBlockParam | Anthropic.ToolUseBlockParam | Anthropic.ToolResultBlockParam
 >
@@ -47,9 +38,9 @@ export class ClaudeDev {
 	private api: ApiHandler
 	private terminalManager: TerminalManager
 	private urlContentFetcher: UrlContentFetcher
-	private didEditFile: boolean = false
 	private customInstructions?: string
 	private alwaysAllowReadOnly: boolean
+	private environmentManager : EnvironmentManager
 	apiConversationHistory: Anthropic.MessageParam[] = []
 	claudeMessages: ClaudeMessage[] = []
 	private askResponse?: ClaudeAskResponse
@@ -60,6 +51,7 @@ export class ClaudeDev {
 	private providerRef: WeakRef<ClaudeDevProvider>
 	private abort: boolean = false
 	private promptBuilder: PromptBuilder
+	private fileSystemHandler: FileSystemHandler
 
 	constructor(
 		provider: ClaudeDevProvider,
@@ -77,6 +69,8 @@ export class ClaudeDev {
 		this.urlContentFetcher = new UrlContentFetcher(provider.context)
 		this.customInstructions = customInstructions
 		this.alwaysAllowReadOnly = alwaysAllowReadOnly ?? false
+		this.environmentManager = new EnvironmentManager(this.terminalManager)
+		this.fileSystemHandler = new FileSystemHandler(this.environmentManager ,(x,y,z) => this.say(x,y,z), (a,b)=>this.ask(a,b), this.alwaysAllowReadOnly);
 
 		if (historyItem) {
 			this.taskId = historyItem.id
@@ -247,7 +241,7 @@ export class ClaudeDev {
 
 		await this.say("text", task, images)
 
-		let imageBlocks: Anthropic.ImageBlockParam[] = this.formatImagesIntoBlocks(images)
+		let imageBlocks: Anthropic.ImageBlockParam[] = formatImagesIntoBlocks(images)
 		await this.initiateTaskLoop([
 			{
 				type: "text",
@@ -434,7 +428,7 @@ export class ClaudeDev {
 		})
 
 		if (responseImages && responseImages.length > 0) {
-			newUserContent.push(...this.formatImagesIntoBlocks(responseImages))
+			newUserContent.push(...formatImagesIntoBlocks(responseImages))
 		}
 
 		await this.overwriteApiConversationHistory(modifiedApiConversationHistory)
@@ -481,11 +475,11 @@ export class ClaudeDev {
 	async executeTool(toolName: ToolName, toolInput: any): Promise<[boolean, ToolResponse]> {
 		switch (toolName) {
 			case "write_to_file":
-				return this.writeToFile(toolInput.path, toolInput.content)
+				return this.fileSystemHandler.writeToFile(toolInput.path, toolInput.content)
 			case "read_file":
-				return this.readFile(toolInput.path)
+				return this.fileSystemHandler.readFile(toolInput.path)
 			case "list_files":
-				return this.listFiles(toolInput.path, toolInput.recursive)
+				return this.fileSystemHandler.listFiles(toolInput.path, toolInput.recursive)
 			case "list_code_definition_names":
 				return this.listCodeDefinitionNames(toolInput.path)
 			case "search_files":
@@ -525,607 +519,10 @@ export class ClaudeDev {
 		return totalCost
 	}
 
-	// return is [didUserRejectTool, ToolResponse]
-	async writeToFile(relPath?: string, newContent?: string): Promise<[boolean, ToolResponse]> {
-		if (relPath === undefined) {
-			this.consecutiveMistakeCount++
-			return [false, await this.sayAndCreateMissingParamError("write_to_file", "path")]
-		}
-		if (newContent === undefined) {
-			this.consecutiveMistakeCount++
-			// Custom error message for this particular case
-			await this.say(
-				"error",
-				`Claude tried to use write_to_file for '${relPath.toPosix()}' without value for required parameter 'content'. This is likely due to reaching the maximum output token limit. Retrying with suggestion to change response size...`
-			)
-			return [
-				false,
-				await this.formatToolError(
-					`Missing value for required parameter 'content'. This may occur if the file is too large, exceeding output limits. Consider splitting into smaller files or reducing content size. Please retry with all required parameters.`
-				),
-			]
-		}
-		this.consecutiveMistakeCount = 0
-		try {
-			const absolutePath = path.resolve(cwd, relPath)
-			const fileExists = await fs
-				.access(absolutePath)
-				.then(() => true)
-				.catch(() => false)
-
-			// if the file is already open, ensure it's not dirty before getting its contents
-			if (fileExists) {
-				const existingDocument = vscode.workspace.textDocuments.find((doc) =>
-					arePathsEqual(doc.uri.fsPath, absolutePath)
-				)
-				if (existingDocument && existingDocument.isDirty) {
-					await existingDocument.save()
-				}
-			}
-
-			// get diagnostics before editing the file, we'll compare to diagnostics after editing to see if claude needs to fix anything
-			const preDiagnostics = vscode.languages.getDiagnostics()
-
-			let originalContent: string
-			if (fileExists) {
-				originalContent = await fs.readFile(absolutePath, "utf-8")
-				// fix issue where claude always removes newline from the file
-				const eol = originalContent.includes("\r\n") ? "\r\n" : "\n"
-				if (originalContent.endsWith(eol) && !newContent.endsWith(eol)) {
-					newContent += eol
-				}
-			} else {
-				originalContent = ""
-			}
-
-			const fileName = path.basename(absolutePath)
-
-			// for new files, create any necessary directories and keep track of new directories to delete if the user denies the operation
-
-			// Keep track of newly created directories
-			const createdDirs: string[] = await this.createDirectoriesForFile(absolutePath)
-			// console.log(`Created directories: ${createdDirs.join(", ")}`)
-			// make sure the file exists before we open it
-			if (!fileExists) {
-				await fs.writeFile(absolutePath, "")
-			}
-
-			// Open the existing file with the new contents
-			const updatedDocument = await vscode.workspace.openTextDocument(vscode.Uri.file(absolutePath))
-
-			// await updatedDocument.save()
-			// const edit = new vscode.WorkspaceEdit()
-			// const fullRange = new vscode.Range(
-			// 	updatedDocument.positionAt(0),
-			// 	updatedDocument.positionAt(updatedDocument.getText().length)
-			// )
-			// edit.replace(updatedDocument.uri, fullRange, newContent)
-			// await vscode.workspace.applyEdit(edit)
-
-			// Windows file locking issues can prevent temporary files from being saved or closed properly.
-			// To avoid these problems, we use in-memory TextDocument objects with the `untitled` scheme.
-			// This method keeps the document entirely in memory, bypassing the filesystem and ensuring
-			// a consistent editing experience across all platforms. This also has the added benefit of not
-			// polluting the user's workspace with temporary files.
-
-			// Create an in-memory document for the new content
-			// const inMemoryDocumentUri = vscode.Uri.parse(`untitled:${fileName}`) // untitled scheme is necessary to open a file without it being saved to disk
-			// const inMemoryDocument = await vscode.workspace.openTextDocument(inMemoryDocumentUri)
-			// const edit = new vscode.WorkspaceEdit()
-			// edit.insert(inMemoryDocumentUri, new vscode.Position(0, 0), newContent)
-			// await vscode.workspace.applyEdit(edit)
-
-			// Show diff
-			await vscode.commands.executeCommand(
-				"vscode.diff",
-				vscode.Uri.parse(`claude-dev-diff:${fileName}`).with({
-					query: Buffer.from(originalContent).toString("base64"),
-				}),
-				updatedDocument.uri,
-				`${fileName}: ${fileExists ? "Original ↔ Claude's Changes" : "New File"} (Editable)`
-			)
-
-			// if the file was already open, close it (must happen after showing the diff view since if it's the only tab the column will close)
-			let documentWasOpen = false
-
-			// close the tab if it's open
-			const tabs = vscode.window.tabGroups.all
-				.map((tg) => tg.tabs)
-				.flat()
-				.filter(
-					(tab) =>
-						tab.input instanceof vscode.TabInputText && arePathsEqual(tab.input.uri.fsPath, absolutePath)
-				)
-			for (const tab of tabs) {
-				await vscode.window.tabGroups.close(tab)
-				// console.log(`Closed tab for ${absolutePath}`)
-				documentWasOpen = true
-			}
-
-			// console.log(`Document was open: ${documentWasOpen}`)
-
-			// edit needs to happen after we close the original tab
-			const edit = new vscode.WorkspaceEdit()
-			if (!fileExists) {
-				edit.insert(updatedDocument.uri, new vscode.Position(0, 0), newContent)
-			} else {
-				const fullRange = new vscode.Range(
-					updatedDocument.positionAt(0),
-					updatedDocument.positionAt(updatedDocument.getText().length)
-				)
-				edit.replace(updatedDocument.uri, fullRange, newContent)
-			}
-			// Apply the edit, but without saving so this doesnt trigger a local save in timeline history
-			await vscode.workspace.applyEdit(edit) // has the added benefit of maintaing the file's original EOLs
-
-			// Find the first range where the content differs and scroll to it
-			if (fileExists) {
-				const diffResult = diff.diffLines(originalContent, newContent)
-				for (let i = 0, lineCount = 0; i < diffResult.length; i++) {
-					const part = diffResult[i]
-					if (part.added || part.removed) {
-						const startLine = lineCount + 1
-						const endLine = lineCount + (part.count || 0)
-						const activeEditor = vscode.window.activeTextEditor
-						if (activeEditor) {
-							try {
-								activeEditor.revealRange(
-									// + 3 to move the editor up slightly as this looks better
-									new vscode.Range(
-										new vscode.Position(startLine, 0),
-										new vscode.Position(
-											Math.min(endLine + 3, activeEditor.document.lineCount - 1),
-											0
-										)
-									),
-									vscode.TextEditorRevealType.InCenter
-								)
-							} catch (error) {
-								console.error(`Error revealing range for ${absolutePath}: ${error}`)
-							}
-						}
-						break
-					}
-					lineCount += part.count || 0
-				}
-			}
-
-			// remove cursor from the document
-			await vscode.commands.executeCommand("workbench.action.focusSideBar")
-
-			let userResponse: {
-				response: ClaudeAskResponse
-				text?: string
-				images?: string[]
-			}
-			if (fileExists) {
-				userResponse = await this.ask(
-					"tool",
-					JSON.stringify({
-						tool: "editedExistingFile",
-						path: this.getReadablePath(relPath),
-						diff: this.createPrettyPatch(relPath, originalContent, newContent),
-					} satisfies ClaudeSayTool)
-				)
-			} else {
-				userResponse = await this.ask(
-					"tool",
-					JSON.stringify({
-						tool: "newFileCreated",
-						path: this.getReadablePath(relPath),
-						content: newContent,
-					} satisfies ClaudeSayTool)
-				)
-			}
-			const { response, text, images } = userResponse
-
-			// const closeInMemoryDocAndDiffViews = async () => {
-			// 	// ensure that the in-memory doc is active editor (this seems to fail on windows machines if its already active, so ignoring if there's an error as it's likely it's already active anyways)
-			// 	// try {
-			// 	// 	await vscode.window.showTextDocument(inMemoryDocument, {
-			// 	// 		preview: false, // ensures it opens in non-preview tab (preview tabs are easily replaced)
-			// 	// 		preserveFocus: false,
-			// 	// 	})
-			// 	// 	// await vscode.window.showTextDocument(inMemoryDocument.uri, { preview: true, preserveFocus: false })
-			// 	// } catch (error) {
-			// 	// 	console.log(`Could not open editor for ${absolutePath}: ${error}`)
-			// 	// }
-			// 	// await delay(50)
-			// 	// // Wait for the in-memory document to become the active editor (sometimes vscode timing issues happen and this would accidentally close claude dev!)
-			// 	// await pWaitFor(
-			// 	// 	() => {
-			// 	// 		return vscode.window.activeTextEditor?.document === inMemoryDocument
-			// 	// 	},
-			// 	// 	{ timeout: 5000, interval: 50 }
-			// 	// )
-
-			// 	// if (vscode.window.activeTextEditor?.document === inMemoryDocument) {
-			// 	// 	await vscode.commands.executeCommand("workbench.action.revertAndCloseActiveEditor") // allows us to close the untitled doc without being prompted to save it
-			// 	// }
-
-			// 	await this.closeDiffViews()
-			// }
-
-			if (response !== "yesButtonTapped") {
-				if (!fileExists) {
-					if (updatedDocument.isDirty) {
-						await updatedDocument.save()
-					}
-					await this.closeDiffViews()
-					await fs.unlink(absolutePath)
-					// Remove only the directories we created, in reverse order
-					for (let i = createdDirs.length - 1; i >= 0; i--) {
-						await fs.rmdir(createdDirs[i])
-						console.log(`Directory ${createdDirs[i]} has been deleted.`)
-					}
-					console.log(`File ${absolutePath} has been deleted.`)
-				} else {
-					// revert document
-					const edit = new vscode.WorkspaceEdit()
-					const fullRange = new vscode.Range(
-						updatedDocument.positionAt(0),
-						updatedDocument.positionAt(updatedDocument.getText().length)
-					)
-					edit.replace(updatedDocument.uri, fullRange, originalContent)
-					// Apply the edit and save, since contents shouldnt have changed this wont show in local history unless of course the user made changes and saved during the edit
-					await vscode.workspace.applyEdit(edit)
-					await updatedDocument.save()
-					console.log(`File ${absolutePath} has been reverted to its original content.`)
-					if (documentWasOpen) {
-						await vscode.window.showTextDocument(vscode.Uri.file(absolutePath), { preview: false })
-					}
-					await this.closeDiffViews()
-				}
-
-				if (response === "messageResponse") {
-					await this.say("user_feedback", text, images)
-					return [true, this.formatToolResponseWithImages(await this.formatToolDeniedFeedback(text), images)]
-				}
-				return [true, await this.formatToolDenied()]
-			}
-
-			// Save the changes
-			const editedContent = updatedDocument.getText()
-			if (updatedDocument.isDirty) {
-				await updatedDocument.save()
-			}
-			this.didEditFile = true
-
-			// Read the potentially edited content from the document
-
-			// trigger an entry in the local history for the file
-			// if (fileExists) {
-			// 	await fs.writeFile(absolutePath, originalContent)
-			// 	const editor = await vscode.window.showTextDocument(vscode.Uri.file(absolutePath), { preview: false })
-			// 	const edit = new vscode.WorkspaceEdit()
-			// 	const fullRange = new vscode.Range(
-			// 		editor.document.positionAt(0),
-			// 		editor.document.positionAt(editor.document.getText().length)
-			// 	)
-			// 	edit.replace(editor.document.uri, fullRange, editedContent)
-			// 	// Apply the edit, this will trigger a local save and timeline history
-			// 	await vscode.workspace.applyEdit(edit) // has the added benefit of maintaing the file's original EOLs
-			// 	await editor.document.save()
-			// }
-
-			// if (!fileExists) {
-			// 	await fs.mkdir(path.dirname(absolutePath), { recursive: true })
-			// 	await fs.writeFile(absolutePath, "")
-			// }
-			// await closeInMemoryDocAndDiffViews()
-
-			// await fs.writeFile(absolutePath, editedContent)
-
-			// open file and add text to it, if it fails fallback to using writeFile
-			// we try doing it this way since it adds to local history for users to see what's changed in the file's timeline
-			// try {
-			// 	const editor = await vscode.window.showTextDocument(vscode.Uri.file(absolutePath), { preview: false })
-			// 	const edit = new vscode.WorkspaceEdit()
-			// 	const fullRange = new vscode.Range(
-			// 		editor.document.positionAt(0),
-			// 		editor.document.positionAt(editor.document.getText().length)
-			// 	)
-			// 	edit.replace(editor.document.uri, fullRange, editedContent)
-			// 	// Apply the edit, this will trigger a local save and timeline history
-			// 	await vscode.workspace.applyEdit(edit) // has the added benefit of maintaing the file's original EOLs
-			// 	await editor.document.save()
-			// } catch (saveError) {
-			// 	console.log(`Could not open editor for ${absolutePath}: ${saveError}`)
-			// 	await fs.writeFile(absolutePath, editedContent)
-			// 	// calling showTextDocument would sometimes fail even though changes were applied, so we'll ignore these one-off errors (likely due to vscode locking issues)
-			// 	try {
-			// 		await vscode.window.showTextDocument(vscode.Uri.file(absolutePath), { preview: false })
-			// 	} catch (openFileError) {
-			// 		console.log(`Could not open editor for ${absolutePath}: ${openFileError}`)
-			// 	}
-			// }
-
-			await vscode.window.showTextDocument(vscode.Uri.file(absolutePath), { preview: false })
-
-			await this.closeDiffViews()
-
-			/*
-			Getting diagnostics before and after the file edit is a better approach than
-			automatically tracking problems in real-time. This method ensures we only
-			report new problems that are a direct result of this specific edit.
-			Since these are new problems resulting from Claude's edit, we know they're
-			directly related to the work he's doing. This eliminates the risk of Claude
-			going off-task or getting distracted by unrelated issues, which was a problem
-			with the previous auto-debug approach. Some users' machines may be slow to
-			update diagnostics, so this approach provides a good balance between automation
-			and avoiding potential issues where Claude might get stuck in loops due to
-			outdated problem information. If no new problems show up by the time the user
-			accepts the changes, they can always debug later using the '@problems' mention.
-			This way, Claude only becomes aware of new problems resulting from his edits
-			and can address them accordingly. If problems don't change immediately after
-			applying a fix, Claude won't be notified, which is generally fine since the
-			initial fix is usually correct and it may just take time for linters to catch up.
-			*/
-			const postDiagnostics = vscode.languages.getDiagnostics()
-			const newProblems = diagnosticsToProblemsString(getNewDiagnostics(preDiagnostics, postDiagnostics), cwd) // will be empty string if no errors/warnings
-			const newProblemsMessage =
-				newProblems.length > 0 ? `\n\nNew problems detected after saving the file:\n${newProblems}` : ""
-			// await vscode.window.showTextDocument(vscode.Uri.file(absolutePath), { preview: false })
-
-			// If the edited content has different EOL characters, we don't want to show a diff with all the EOL differences.
-			const newContentEOL = newContent.includes("\r\n") ? "\r\n" : "\n"
-			const normalizedEditedContent = editedContent.replace(/\r\n|\n/g, newContentEOL)
-			const normalizedNewContent = newContent.replace(/\r\n|\n/g, newContentEOL) // just in case the new content has a mix of varying EOL characters
-			if (normalizedEditedContent !== normalizedNewContent) {
-				const userDiff = diff.createPatch(relPath.toPosix(), normalizedNewContent, normalizedEditedContent)
-				await this.say(
-					"user_feedback_diff",
-					JSON.stringify({
-						tool: fileExists ? "editedExistingFile" : "newFileCreated",
-						path: this.getReadablePath(relPath),
-						diff: this.createPrettyPatch(relPath, normalizedNewContent, normalizedEditedContent),
-					} satisfies ClaudeSayTool)
-				)
-				return [
-					false,
-					await this.formatToolResult(
-						`The user made the following updates to your content:\n\n${userDiff}\n\nThe updated content, which includes both your original modifications and the user's additional edits, has been successfully saved to ${relPath.toPosix()}. (Note this does not mean you need to re-write the file with the user's changes, as they have already been applied to the file.)${newProblemsMessage}`
-					),
-				]
-			} else {
-				return [
-					false,
-					await this.formatToolResult(
-						`The content was successfully saved to ${relPath.toPosix()}.${newProblemsMessage}`
-					),
-				]
-			}
-		} catch (error) {
-			const errorString = `Error writing file: ${JSON.stringify(serializeError(error))}`
-			await this.say(
-				"error",
-				`Error writing file:\n${error.message ?? JSON.stringify(serializeError(error), null, 2)}`
-			)
-			return [false, await this.formatToolError(errorString)]
-		}
-	}
-
-	/**
-	 * Asynchronously creates all non-existing subdirectories for a given file path
-	 * and collects them in an array for later deletion.
-	 *
-	 * @param filePath - The full path to a file.
-	 * @returns A promise that resolves to an array of newly created directories.
-	 */
-	async createDirectoriesForFile(filePath: string): Promise<string[]> {
-		const newDirectories: string[] = []
-		const normalizedFilePath = path.normalize(filePath) // Normalize path for cross-platform compatibility
-		const directoryPath = path.dirname(normalizedFilePath)
-
-		let currentPath = directoryPath
-		const dirsToCreate: string[] = []
-
-		// Traverse up the directory tree and collect missing directories
-		while (!(await this.exists(currentPath))) {
-			dirsToCreate.push(currentPath)
-			currentPath = path.dirname(currentPath)
-		}
-
-		// Create directories from the topmost missing one down to the target directory
-		for (let i = dirsToCreate.length - 1; i >= 0; i--) {
-			await fs.mkdir(dirsToCreate[i])
-			newDirectories.push(dirsToCreate[i])
-		}
-
-		return newDirectories
-	}
-
-	/**
-	 * Helper function to check if a path exists.
-	 *
-	 * @param path - The path to check.
-	 * @returns A promise that resolves to true if the path exists, false otherwise.
-	 */
-	async exists(filePath: string): Promise<boolean> {
-		try {
-			await fs.access(filePath)
-			return true
-		} catch {
-			return false
-		}
-	}
-
-	createPrettyPatch(filename = "file", oldStr: string, newStr: string) {
-		const patch = diff.createPatch(filename.toPosix(), oldStr, newStr)
-		const lines = patch.split("\n")
-		const prettyPatchLines = lines.slice(4)
-		return prettyPatchLines.join("\n")
-	}
-
-	async closeDiffViews() {
-		const tabs = vscode.window.tabGroups.all
-			.map((tg) => tg.tabs)
-			.flat()
-			.filter(
-				(tab) =>
-					tab.input instanceof vscode.TabInputTextDiff && tab.input?.original?.scheme === "claude-dev-diff"
-			)
-
-		for (const tab of tabs) {
-			// trying to close dirty views results in save popup
-			if (!tab.isDirty) {
-				await vscode.window.tabGroups.close(tab)
-			}
-		}
-	}
-
-	async readFile(relPath?: string): Promise<[boolean, ToolResponse]> {
-		if (relPath === undefined) {
-			this.consecutiveMistakeCount++
-			return [false, await this.sayAndCreateMissingParamError("read_file", "path")]
-		}
-		this.consecutiveMistakeCount = 0
-		try {
-			const absolutePath = path.resolve(cwd, relPath)
-			const content = await extractTextFromFile(absolutePath)
-
-			const message = JSON.stringify({
-				tool: "readFile",
-				path: this.getReadablePath(relPath),
-				content: absolutePath,
-			} satisfies ClaudeSayTool)
-			if (this.alwaysAllowReadOnly) {
-				await this.say("tool", message)
-			} else {
-				const { response, text, images } = await this.ask("tool", message)
-				if (response !== "yesButtonTapped") {
-					if (response === "messageResponse") {
-						await this.say("user_feedback", text, images)
-						return [
-							true,
-							this.formatToolResponseWithImages(await this.formatToolDeniedFeedback(text), images),
-						]
-					}
-					return [true, await this.formatToolDenied()]
-				}
-			}
-
-			return [false, content]
-		} catch (error) {
-			const errorString = `Error reading file: ${JSON.stringify(serializeError(error))}`
-			await this.say(
-				"error",
-				`Error reading file:\n${error.message ?? JSON.stringify(serializeError(error), null, 2)}`
-			)
-			return [false, await this.formatToolError(errorString)]
-		}
-	}
-
-	async listFiles(relDirPath?: string, recursiveRaw?: string): Promise<[boolean, ToolResponse]> {
-		if (relDirPath === undefined) {
-			this.consecutiveMistakeCount++
-			return [false, await this.sayAndCreateMissingParamError("list_files", "path")]
-		}
-		this.consecutiveMistakeCount = 0
-		try {
-			const recursive = recursiveRaw?.toLowerCase() === "true"
-			const absolutePath = path.resolve(cwd, relDirPath)
-			const [files, didHitLimit] = await listFiles(absolutePath, recursive, 200)
-			const result = this.formatFilesList(absolutePath, files, didHitLimit)
-
-			const message = JSON.stringify({
-				tool: recursive ? "listFilesRecursive" : "listFilesTopLevel",
-				path: this.getReadablePath(relDirPath),
-				content: result,
-			} satisfies ClaudeSayTool)
-			if (this.alwaysAllowReadOnly) {
-				await this.say("tool", message)
-			} else {
-				const { response, text, images } = await this.ask("tool", message)
-				if (response !== "yesButtonTapped") {
-					if (response === "messageResponse") {
-						await this.say("user_feedback", text, images)
-						return [
-							true,
-							this.formatToolResponseWithImages(await this.formatToolDeniedFeedback(text), images),
-						]
-					}
-					return [true, await this.formatToolDenied()]
-				}
-			}
-
-			return [false, await this.formatToolResult(result)]
-		} catch (error) {
-			const errorString = `Error listing files and directories: ${JSON.stringify(serializeError(error))}`
-			await this.say(
-				"error",
-				`Error listing files and directories:\n${
-					error.message ?? JSON.stringify(serializeError(error), null, 2)
-				}`
-			)
-			return [false, await this.formatToolError(errorString)]
-		}
-	}
-
-	getReadablePath(relPath: string): string {
-		// path.resolve is flexible in that it will resolve relative paths like '../../' to the cwd and even ignore the cwd if the relPath is actually an absolute path
-		const absolutePath = path.resolve(cwd, relPath)
-		if (arePathsEqual(cwd, path.join(os.homedir(), "Desktop"))) {
-			// User opened vscode without a workspace, so cwd is the Desktop. Show the full absolute path to keep the user aware of where files are being created
-			return absolutePath.toPosix()
-		}
-		if (arePathsEqual(path.normalize(absolutePath), path.normalize(cwd))) {
-			return path.basename(absolutePath).toPosix()
-		} else {
-			// show the relative path to the cwd
-			const normalizedRelPath = path.relative(cwd, absolutePath)
-			if (absolutePath.includes(cwd)) {
-				return normalizedRelPath.toPosix()
-			} else {
-				// we are outside the cwd, so show the absolute path (useful for when claude passes in '../../' for example)
-				return absolutePath.toPosix()
-			}
-		}
-	}
-
-	formatFilesList(absolutePath: string, files: string[], didHitLimit: boolean): string {
-		const sorted = files
-			.map((file) => {
-				// convert absolute path to relative path
-				const relativePath = path.relative(absolutePath, file).toPosix()
-				return file.endsWith("/") ? relativePath + "/" : relativePath
-			})
-			// Sort so files are listed under their respective directories to make it clear what files are children of what directories. Since we build file list top down, even if file list is truncated it will show directories that claude can then explore further.
-			.sort((a, b) => {
-				const aParts = a.split("/") // only works if we use toPosix first
-				const bParts = b.split("/")
-				for (let i = 0; i < Math.min(aParts.length, bParts.length); i++) {
-					if (aParts[i] !== bParts[i]) {
-						// If one is a directory and the other isn't at this level, sort the directory first
-						if (i + 1 === aParts.length && i + 1 < bParts.length) {
-							return -1
-						}
-						if (i + 1 === bParts.length && i + 1 < aParts.length) {
-							return 1
-						}
-						// Otherwise, sort alphabetically
-						return aParts[i].localeCompare(bParts[i], undefined, { numeric: true, sensitivity: "base" })
-					}
-				}
-				// If all parts are the same up to the length of the shorter path,
-				// the shorter one comes first
-				return aParts.length - bParts.length
-			})
-		if (didHitLimit) {
-			return `${sorted.join(
-				"\n"
-			)}\n\n(File list truncated. Use list_files on specific subdirectories if you need to explore further.)`
-		} else if (sorted.length === 0 || (sorted.length === 1 && sorted[0] === "")) {
-			return "No files found."
-		} else {
-			return sorted.join("\n")
-		}
-	}
-
 	async listCodeDefinitionNames(relDirPath?: string): Promise<[boolean, ToolResponse]> {
 		if (relDirPath === undefined) {
 			this.consecutiveMistakeCount++
-			return [false, await this.sayAndCreateMissingParamError("list_code_definition_names", "path")]
+			return [false, await this.fileSystemHandler.sayAndCreateMissingParamError("list_code_definition_names", "path")]
 		}
 		this.consecutiveMistakeCount = 0
 		try {
@@ -1134,7 +531,7 @@ export class ClaudeDev {
 
 			const message = JSON.stringify({
 				tool: "listCodeDefinitionNames",
-				path: this.getReadablePath(relDirPath),
+				path: getReadablePath(relDirPath),
 				content: result,
 			} satisfies ClaudeSayTool)
 			if (this.alwaysAllowReadOnly) {
@@ -1146,14 +543,14 @@ export class ClaudeDev {
 						await this.say("user_feedback", text, images)
 						return [
 							true,
-							this.formatToolResponseWithImages(await this.formatToolDeniedFeedback(text), images),
+							formatToolResponseWithImages(await this.fileSystemHandler.formatToolDeniedFeedback(text), images),
 						]
 					}
-					return [true, await this.formatToolDenied()]
+					return [true, await this.fileSystemHandler.formatToolDenied()]
 				}
 			}
 
-			return [false, await this.formatToolResult(result)]
+			return [false, await this.fileSystemHandler.formatToolResult(result)]
 		} catch (error) {
 			const errorString = `Error parsing source code definitions: ${JSON.stringify(serializeError(error))}`
 			await this.say(
@@ -1162,18 +559,18 @@ export class ClaudeDev {
 					error.message ?? JSON.stringify(serializeError(error), null, 2)
 				}`
 			)
-			return [false, await this.formatToolError(errorString)]
+			return [false, await this.fileSystemHandler.formatToolError(errorString)]
 		}
 	}
 
 	async searchFiles(relDirPath: string, regex: string, filePattern?: string): Promise<[boolean, ToolResponse]> {
 		if (relDirPath === undefined) {
 			this.consecutiveMistakeCount++
-			return [false, await this.sayAndCreateMissingParamError("search_files", "path")]
+			return [false, await this.fileSystemHandler.sayAndCreateMissingParamError("search_files", "path")]
 		}
 		if (regex === undefined) {
 			this.consecutiveMistakeCount++
-			return [false, await this.sayAndCreateMissingParamError("search_files", "regex", relDirPath)]
+			return [false, await this.fileSystemHandler.sayAndCreateMissingParamError("search_files", "regex", relDirPath)]
 		}
 		this.consecutiveMistakeCount = 0
 		try {
@@ -1182,7 +579,7 @@ export class ClaudeDev {
 
 			const message = JSON.stringify({
 				tool: "searchFiles",
-				path: this.getReadablePath(relDirPath),
+				path: getReadablePath(relDirPath),
 				regex: regex,
 				filePattern: filePattern,
 				content: results,
@@ -1197,28 +594,28 @@ export class ClaudeDev {
 						await this.say("user_feedback", text, images)
 						return [
 							true,
-							this.formatToolResponseWithImages(await this.formatToolDeniedFeedback(text), images),
+							formatToolResponseWithImages(await this.fileSystemHandler.formatToolDeniedFeedback(text), images),
 						]
 					}
-					return [true, await this.formatToolDenied()]
+					return [true, await this.fileSystemHandler.formatToolDenied()]
 				}
 			}
 
-			return [false, await this.formatToolResult(results)]
+			return [false, await this.fileSystemHandler.formatToolResult(results)]
 		} catch (error) {
 			const errorString = `Error searching files: ${JSON.stringify(serializeError(error))}`
 			await this.say(
 				"error",
 				`Error searching files:\n${error.message ?? JSON.stringify(serializeError(error), null, 2)}`
 			)
-			return [false, await this.formatToolError(errorString)]
+			return [false, await this.fileSystemHandler.formatToolError(errorString)]
 		}
 	}
 
 	async inspectSite(url?: string): Promise<[boolean, ToolResponse]> {
 		if (url === undefined) {
 			this.consecutiveMistakeCount++
-			return [false, await this.sayAndCreateMissingParamError("inspect_site", "url")]
+			return [false, await this.fileSystemHandler.sayAndCreateMissingParamError("inspect_site", "url")]
 		}
 		this.consecutiveMistakeCount = 0
 		try {
@@ -1236,10 +633,10 @@ export class ClaudeDev {
 						await this.say("user_feedback", text, images)
 						return [
 							true,
-							this.formatToolResponseWithImages(await this.formatToolDeniedFeedback(text), images),
+							formatToolResponseWithImages(await this.fileSystemHandler.formatToolDeniedFeedback(text), images),
 						]
 					}
-					return [true, await this.formatToolDenied()]
+					return [true, await this.fileSystemHandler.formatToolDenied()]
 				}
 			}
 
@@ -1259,7 +656,7 @@ export class ClaudeDev {
 
 			return [
 				false,
-				this.formatToolResponseWithImages(
+				formatToolResponseWithImages(
 					`The site has been visited, with console logs captured and a screenshot taken for your analysis.\n\nConsole logs:\n${
 						logs || "(No logs)"
 					}`,
@@ -1272,7 +669,7 @@ export class ClaudeDev {
 				"error",
 				`Error inspecting site:\n${error.message ?? JSON.stringify(serializeError(error), null, 2)}`
 			)
-			return [false, await this.formatToolError(errorString)]
+			return [false, await this.fileSystemHandler.formatToolError(errorString)]
 		}
 	}
 
@@ -1282,16 +679,16 @@ export class ClaudeDev {
 	): Promise<[boolean, ToolResponse]> {
 		if (command === undefined) {
 			this.consecutiveMistakeCount++
-			return [false, await this.sayAndCreateMissingParamError("execute_command", "command")]
+			return [false, await this.fileSystemHandler.sayAndCreateMissingParamError("execute_command", "command")]
 		}
 		this.consecutiveMistakeCount = 0
 		const { response, text, images } = await this.ask("command", command)
 		if (response !== "yesButtonTapped") {
 			if (response === "messageResponse") {
 				await this.say("user_feedback", text, images)
-				return [true, this.formatToolResponseWithImages(await this.formatToolDeniedFeedback(text), images)]
+				return [true, formatToolResponseWithImages(await this.fileSystemHandler.formatToolDeniedFeedback(text), images)]
 			}
-			return [true, await this.formatToolDenied()]
+			return [true, await this.fileSystemHandler.formatToolDenied()]
 		}
 
 		try {
@@ -1350,7 +747,7 @@ export class ClaudeDev {
 				await this.say("user_feedback", userFeedback.text, userFeedback.images)
 				return [
 					true,
-					this.formatToolResponseWithImages(
+					formatToolResponseWithImages(
 						`Command is still running in the user's terminal.${
 							result.length > 0 ? `\nHere's the output so far:\n${result}` : ""
 						}\n\nThe user provided the following feedback:\n<feedback>\n${userFeedback.text}\n</feedback>`,
@@ -1366,12 +763,12 @@ export class ClaudeDev {
 			if (completed) {
 				return [
 					false,
-					await this.formatToolResult(`Command executed.${result.length > 0 ? `\nOutput:\n${result}` : ""}`),
+					await this.fileSystemHandler.formatToolResult(`Command executed.${result.length > 0 ? `\nOutput:\n${result}` : ""}`),
 				]
 			} else {
 				return [
 					false,
-					await this.formatToolResult(
+					await this.fileSystemHandler.formatToolResult(
 						`Command is still running in the user's terminal.${
 							result.length > 0 ? `\nHere's the output so far:\n${result}` : ""
 						}\n\nYou will be updated on the terminal status and new output in the future.`
@@ -1382,26 +779,26 @@ export class ClaudeDev {
 			let errorMessage = error.message || JSON.stringify(serializeError(error), null, 2)
 			const errorString = `Error executing command:\n${errorMessage}`
 			await this.say("error", `Error executing command:\n${errorMessage}`)
-			return [false, await this.formatToolError(errorString)]
+			return [false, await this.fileSystemHandler.formatToolError(errorString)]
 		}
 	}
 
 	async askFollowupQuestion(question?: string): Promise<[boolean, ToolResponse]> {
 		if (question === undefined) {
 			this.consecutiveMistakeCount++
-			return [false, await this.sayAndCreateMissingParamError("ask_followup_question", "question")]
+			return [false, await this.fileSystemHandler.sayAndCreateMissingParamError("ask_followup_question", "question")]
 		}
 		this.consecutiveMistakeCount = 0
 		const { text, images } = await this.ask("followup", question)
 		await this.say("user_feedback", text ?? "", images)
-		return [false, this.formatToolResponseWithImages(`<answer>\n${text}\n</answer>`, images)]
+		return [false, formatToolResponseWithImages(`<answer>\n${text}\n</answer>`, images)]
 	}
 
 	async attemptCompletion(result?: string, command?: string): Promise<[boolean, ToolResponse]> {
 		// result is required, command is optional
 		if (result === undefined) {
 			this.consecutiveMistakeCount++
-			return [false, await this.sayAndCreateMissingParamError("attempt_completion", "result")]
+			return [false, await this.fileSystemHandler.sayAndCreateMissingParamError("attempt_completion", "result")]
 		}
 		this.consecutiveMistakeCount = 0
 		let resultToSend = result
@@ -1422,7 +819,7 @@ export class ClaudeDev {
 		await this.say("user_feedback", text ?? "", images)
 		return [
 			true,
-			this.formatToolResponseWithImages(
+			formatToolResponseWithImages(
 				`The user has provided feedback on the results. Consider their input to continue the task, and then attempt completion again.\n<feedback>\n${text}\n</feedback>`,
 				images
 			),
@@ -1503,7 +900,7 @@ export class ClaudeDev {
 							type: "text",
 							text: `You seem to be having trouble proceeding. The user has provided the following feedback to help guide you:\n<feedback>\n${text}\n</feedback>`,
 						} as Anthropic.Messages.TextBlockParam,
-						...this.formatImagesIntoBlocks(images),
+						...formatImagesIntoBlocks(images),
 					]
 				)
 			}
@@ -1564,7 +961,7 @@ export class ClaudeDev {
 					return block
 				})
 			),
-			this.getEnvironmentDetails(includeFileDetails),
+			this.environmentManager.getEnvironmentDetails(includeFileDetails),
 		])
 
 		userContent = parsedUserContent
@@ -1731,192 +1128,5 @@ export class ClaudeDev {
 		}
 	}
 
-	// Formatting responses to Claude
 
-	private formatImagesIntoBlocks(images?: string[]): Anthropic.ImageBlockParam[] {
-		return images
-			? images.map((dataUrl) => {
-					// data:image/png;base64,base64string
-					const [rest, base64] = dataUrl.split(",")
-					const mimeType = rest.split(":")[1].split(";")[0]
-					return {
-						type: "image",
-						source: { type: "base64", media_type: mimeType, data: base64 },
-					} as Anthropic.ImageBlockParam
-			  })
-			: []
-	}
-
-	private formatToolResponseWithImages(text: string, images?: string[]): ToolResponse {
-		if (images && images.length > 0) {
-			const textBlock: Anthropic.TextBlockParam = { type: "text", text }
-			const imageBlocks: Anthropic.ImageBlockParam[] = this.formatImagesIntoBlocks(images)
-			// Placing images after text leads to better results
-			return [textBlock, ...imageBlocks]
-		} else {
-			return text
-		}
-	}
-
-	async getEnvironmentDetails(includeFileDetails: boolean = false) {
-		let details = ""
-
-		// It could be useful for claude to know if the user went from one or no file to another between messages, so we always include this context
-		details += "\n\n# VSCode Visible Files"
-		const visibleFiles = vscode.window.visibleTextEditors
-			?.map((editor) => editor.document?.uri?.fsPath)
-			.filter(Boolean)
-			.map((absolutePath) => path.relative(cwd, absolutePath).toPosix())
-			.join("\n")
-		if (visibleFiles) {
-			details += `\n${visibleFiles}`
-		} else {
-			details += "\n(No visible files)"
-		}
-
-		details += "\n\n# LOCAL SYSTEM INFORMATION\n"
-		details += `Operating System: ${osName()}\n`
-		details += `Default Shell: ${defaultShell}\n`
-
-		details += "\n\n# VSCode Open Tabs"
-		const openTabs = vscode.window.tabGroups.all
-			.flatMap((group) => group.tabs)
-			.map((tab) => (tab.input as vscode.TabInputText)?.uri?.fsPath)
-			.filter(Boolean)
-			.map((absolutePath) => path.relative(cwd, absolutePath).toPosix())
-			.join("\n")
-		if (openTabs) {
-			details += `\n${openTabs}`
-		} else {
-			details += "\n(No open tabs)"
-		}
-
-		const busyTerminals = this.terminalManager.getTerminals(true)
-		const inactiveTerminals = this.terminalManager.getTerminals(false)
-		// const allTerminals = [...busyTerminals, ...inactiveTerminals]
-
-		if (busyTerminals.length > 0 && this.didEditFile) {
-			//  || this.didEditFile
-			await delay(300) // delay after saving file to let terminals catch up
-		}
-
-		// let terminalWasBusy = false
-		if (busyTerminals.length > 0) {
-			// wait for terminals to cool down
-			// terminalWasBusy = allTerminals.some((t) => this.terminalManager.isProcessHot(t.id))
-			await pWaitFor(() => busyTerminals.every((t) => !this.terminalManager.isProcessHot(t.id)), {
-				interval: 100,
-				timeout: 15_000,
-			}).catch(() => {})
-		}
-
-		// we want to get diagnostics AFTER terminal cools down for a few reasons: terminal could be scaffolding a project, dev servers (compilers like webpack) will first re-compile and then send diagnostics, etc
-		/*
-		let diagnosticsDetails = ""
-		const diagnostics = await this.diagnosticsMonitor.getCurrentDiagnostics(this.didEditFile || terminalWasBusy) // if claude ran a command (ie npm install) or edited the workspace then wait a bit for updated diagnostics
-		for (const [uri, fileDiagnostics] of diagnostics) {
-			const problems = fileDiagnostics.filter((d) => d.severity === vscode.DiagnosticSeverity.Error)
-			if (problems.length > 0) {
-				diagnosticsDetails += `\n## ${path.relative(cwd, uri.fsPath)}`
-				for (const diagnostic of problems) {
-					// let severity = diagnostic.severity === vscode.DiagnosticSeverity.Error ? "Error" : "Warning"
-					const line = diagnostic.range.start.line + 1 // VSCode lines are 0-indexed
-					const source = diagnostic.source ? `[${diagnostic.source}] ` : ""
-					diagnosticsDetails += `\n- ${source}Line ${line}: ${diagnostic.message}`
-				}
-			}
-		}
-		*/
-		this.didEditFile = false // reset, this lets us know when to wait for saved files to update terminals
-
-		// waiting for updated diagnostics lets terminal output be the most up-to-date possible
-		let terminalDetails = ""
-		if (busyTerminals.length > 0) {
-			// terminals are cool, let's retrieve their output
-			terminalDetails += "\n\n# Active Terminals"
-			for (const busyTerminal of busyTerminals) {
-				terminalDetails += `\n## ${busyTerminal.lastCommand}`
-				const newOutput = this.terminalManager.getUnretrievedOutput(busyTerminal.id)
-				if (newOutput) {
-					terminalDetails += `\n### New Output\n${newOutput}`
-				} else {
-					// details += `\n(Still running, no new output)` // don't want to show this right after running the command
-				}
-			}
-		}
-		// only show inactive terminals if there's output to show
-		if (inactiveTerminals.length > 0) {
-			const inactiveTerminalOutputs = new Map<number, string>()
-			for (const inactiveTerminal of inactiveTerminals) {
-				const newOutput = this.terminalManager.getUnretrievedOutput(inactiveTerminal.id)
-				if (newOutput) {
-					inactiveTerminalOutputs.set(inactiveTerminal.id, newOutput)
-				}
-			}
-			if (inactiveTerminalOutputs.size > 0) {
-				terminalDetails += "\n\n# Inactive Terminals"
-				for (const [terminalId, newOutput] of inactiveTerminalOutputs) {
-					const inactiveTerminal = inactiveTerminals.find((t) => t.id === terminalId)
-					if (inactiveTerminal) {
-						terminalDetails += `\n## ${inactiveTerminal.lastCommand}`
-						terminalDetails += `\n### New Output\n${newOutput}`
-					}
-				}
-			}
-		}
-
-		// details += "\n\n# VSCode Workspace Errors"
-		// if (diagnosticsDetails) {
-		// 	details += diagnosticsDetails
-		// } else {
-		// 	details += "\n(No errors detected)"
-		// }
-
-		if (terminalDetails) {
-			details += terminalDetails
-		}
-
-		if (includeFileDetails) {
-			details += `\n\n# Current Working Directory (${cwd.toPosix()}) Files\n`
-			const isDesktop = arePathsEqual(cwd, path.join(os.homedir(), "Desktop"))
-			if (isDesktop) {
-				// don't want to immediately access desktop since it would show permission popup
-				details += "(Desktop files not shown automatically. Use list_files to explore if needed.)"
-			} else {
-				const [files, didHitLimit] = await listFiles(cwd, true, 200)
-				const result = this.formatFilesList(cwd, files, didHitLimit)
-				details += result
-			}
-		}
-
-		return `<environment_details>\n${details.trim()}\n</environment_details>`
-	}
-
-	async formatToolDeniedFeedback(feedback?: string) {
-		return `The user denied this operation and provided the following feedback:\n<feedback>\n${feedback}\n</feedback>`
-	}
-
-	async formatToolDenied() {
-		return `The user denied this operation.`
-	}
-
-	async formatToolResult(result: string) {
-		return result // the successful result of the tool should never be manipulated, if we need to add details it should be as a separate user text block
-	}
-
-	async formatToolError(error?: string) {
-		return `The tool execution failed with the following error:\n<error>\n${error}\n</error>`
-	}
-
-	async sayAndCreateMissingParamError(toolName: ToolName, paramName: string, relPath?: string) {
-		await this.say(
-			"error",
-			`Claude tried to use ${toolName}${
-				relPath ? ` for '${relPath.toPosix()}'` : ""
-			} without value for required parameter '${paramName}'. Retrying...`
-		)
-		return await this.formatToolError(
-			`Missing value for required parameter '${paramName}'. Please retry with complete response.`
-		)
-	}
 }
