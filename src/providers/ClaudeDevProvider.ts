@@ -397,7 +397,7 @@ export class ClaudeDevProvider implements vscode.WebviewViewProvider {
 						await this.postMessageToWebview({ type: "selectedImages", images })
 						break
 					case "exportCurrentTask":
-						const currentTaskId = this.claudeDev?.taskId
+						const currentTaskId = this.claudeDev?.taskManager.getTaskId()
 						if (currentTaskId) {
 							this.exportTaskWithId(currentTaskId)
 						}
@@ -522,7 +522,7 @@ export class ClaudeDevProvider implements vscode.WebviewViewProvider {
 	}
 
 	async showTaskWithId(id: string) {
-		if (id !== this.claudeDev?.taskId) {
+		if (id !== this.claudeDev?.taskManager.getTaskId()) {
 			// non-current task
 			const { historyItem } = await this.getTaskWithId(id)
 			await this.initClaudeDevWithHistoryItem(historyItem) // clears existing task
@@ -536,7 +536,7 @@ export class ClaudeDevProvider implements vscode.WebviewViewProvider {
 	}
 
 	async deleteTaskWithId(id: string) {
-		if (id === this.claudeDev?.taskId) {
+		if (id === this.claudeDev?.taskManager.getTaskId()) {
 			await this.clearTask()
 		}
 
